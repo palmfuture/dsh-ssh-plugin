@@ -9,8 +9,11 @@
         maxTimeoutMs: 600000
         maxOutputBytes: 100000
         maxResultBytes: 200000
-        strictHostKeyChecking: accept-new
+        strictHostKeyChecking: 'yes'
         extraOptions: []
         maxConcurrency: 4
         maxSessionsPerAgent: 4
         sessionBufferBytes: 262144
+        confineLocalPaths: true
+        localPathRoot: ''
+        maxConfigBytes: 1048576
