@@ -1,0 +1,46 @@
+{
+  "name": "@local/ssh-remote",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Run commands, copy files, and drive interactive shells on remote machines over SSH.",
+  "license": "MIT",
+  "author": "Wisit Srimala",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "ssh",
+    "remote",
+    "scp"
+  ],
+  "homepage": "https://github.com/palmfuture/dsh-ssh-plugin#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/palmfuture/dsh-ssh-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/palmfuture/dsh-ssh-plugin/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "README.md",
+    "LICENSE",
+    "icon.svg"
+  ],
+  "engines": {
+    "dsh": "^0.2.3-alpha.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
