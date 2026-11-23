@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "SSH remote control",
-    "description": "Adds ssh_hosts, ssh_exec, ssh_copy, and ssh_session tools so the agent can discover SSH destinations, run commands on one or more remote machines, transfer files with scp, and drive interactive shells with an allocated remote terminal. It uses the keys and ssh-agent entries on this machine; host keys follow StrictHostKeyChecking=accept-new by default, and password prompts are not supported. Ask the agent to start with ssh_hosts, then use ssh_exec for one-shot commands or ssh_session for streaming and interactive work. Local scp paths run outside the session file sandbox. Disabling the plugin removes the tools and closes open sessions."
+    "description": "Adds ssh_hosts, ssh_exec, ssh_copy, and ssh_session tools so the agent can discover SSH destinations, run commands on one or more remote machines, transfer files with scp, and drive interactive shells with an allocated remote terminal. It uses the keys and ssh-agent entries on this machine; host keys are verified against known_hosts (StrictHostKeyChecking=yes by default), local scp paths are confined to the session workspace by default, and password prompts are not supported. Never send passwords or tokens through tool input because it is persisted in the session log. Disabling the plugin removes the tools and closes open sessions."
   }
 }

@@ -14,9 +14,9 @@
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { delimiter, isAbsolute, resolve } from 'node:path'
+import { delimiter, dirname, isAbsolute, relative, resolve } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 
 export const name = 'ssh-remote'
@@ -31,11 +31,14 @@ const DEFAULT_CONFIG = {
   maxTimeoutMs: 600_000,
   maxOutputBytes: 100_000,
   maxResultBytes: 200_000,
-  strictHostKeyChecking: 'accept-new',
+  strictHostKeyChecking: 'yes',
   extraOptions: [],
   maxConcurrency: 4,
   maxSessionsPerAgent: 4,
   sessionBufferBytes: 262_144,
+  confineLocalPaths: true,
+  localPathRoot: '',
+  maxConfigBytes: 1_048_576,
 }
 
 /** Accepted StrictHostKeyChecking values for OpenSSH. */
@@ -74,25 +77,50 @@ function normalizeConfig(raw) {
     maxConcurrency: integer(source.maxConcurrency, DEFAULT_CONFIG.maxConcurrency, 1, 16),
     maxSessionsPerAgent: integer(source.maxSessionsPerAgent, DEFAULT_CONFIG.maxSessionsPerAgent, 1, 16),
     sessionBufferBytes: integer(source.sessionBufferBytes, DEFAULT_CONFIG.sessionBufferBytes, 4_096, 1_048_576),
+    confineLocalPaths: typeof source.confineLocalPaths === 'boolean' ? source.confineLocalPaths : DEFAULT_CONFIG.confineLocalPaths,
+    localPathRoot: typeof source.localPathRoot === 'string' ? source.localPathRoot.trim() : DEFAULT_CONFIG.localPathRoot,
+    maxConfigBytes: integer(source.maxConfigBytes, DEFAULT_CONFIG.maxConfigBytes, 1_024, 16_777_216),
   }
 }
 
 /**
- * Resolve an SSH-family executable. A bare name is searched in PATH and the
- * usual system directories, so the GUI-launched Host does not depend on a
- * shell-inherited PATH.
+ * Whether a directory is writable by a user other than its owner. A POSIX
+ * directory that anyone can write to is an unsafe place to resolve an
+ * executable from.
+ * @param {string} directory - directory to inspect.
+ * @returns {boolean} true when group or other write bits are set.
+ */
+function isWritableByOthers(directory) {
+  try {
+    return (statSync(directory).mode & 0o022) !== 0
+  } catch {
+    return true
+  }
+}
+
+/**
+ * Resolve an SSH-family executable. Bare names prefer the system directories
+ * before PATH and skip directories that group or others can write to, so a
+ * hijacked PATH entry cannot substitute the binary. When no safe candidate
+ * exists, the first existing candidate is used as a last resort.
  * @param {string} command - configured executable name or path.
- * @returns {string} a path or the original bare name.
+ * @returns {string} a resolved path, or the original bare name.
  */
 function resolveBinary(command) {
-  if (command.includes('/')) return command
-  const directories = [...(process.env.PATH ?? '').split(delimiter), '/usr/bin', '/bin', '/usr/local/bin', '/opt/homebrew/bin']
-  for (const directory of directories) {
-    if (directory === '') continue
-    const candidate = resolve(directory, command)
-    if (existsSync(candidate)) return candidate
+  if (command.includes('/') || command.includes('\\')) return command
+  const trusted = process.platform === 'win32' ? [] : ['/usr/bin', '/bin', '/usr/local/bin', '/opt/homebrew/bin']
+  const seen = new Set()
+  const directories = []
+  for (const directory of [...trusted, ...(process.env.PATH ?? '').split(delimiter)]) {
+    if (directory === '' || seen.has(directory)) continue
+    seen.add(directory)
+    directories.push(directory)
   }
-  return command
+  const existing = directories.map(directory => resolve(directory, command)).filter(candidate => existsSync(candidate))
+  const safe = process.platform === 'win32'
+    ? existing
+    : existing.filter(candidate => !isWritableByOthers(dirname(candidate)))
+  return safe[0] ?? existing[0] ?? command
 }
 
 /**
@@ -325,24 +353,20 @@ function parseSshConfig(text) {
 }
 
 /**
- * Read non-hashed host names from a known_hosts file.
- * @param {string} path - known_hosts path.
+ * Extract non-hashed host names from known_hosts text.
+ * @param {string} text - known_hosts contents.
  * @returns {string[]} sorted unique host names.
  */
-function readKnownHosts(path) {
-  try {
-    const names = new Set()
-    for (const rawLine of readFileSync(path, 'utf8').split(/\r?\n/)) {
-      const line = rawLine.trim()
-      if (line === '' || line.startsWith('#')) continue
-      const name = line.split(/\s+/)[0]
-      if (name.startsWith('|') || name.startsWith('@')) continue
-      names.add(name)
-    }
-    return [...names].sort()
-  } catch {
-    return []
+function parseKnownHosts(text) {
+  const names = new Set()
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (line === '' || line.startsWith('#')) continue
+    const name = line.split(/\s+/)[0]
+    if (name.startsWith('|') || name.startsWith('@')) continue
+    names.add(name)
   }
+  return [...names].sort()
 }
 
 /**
@@ -478,6 +502,54 @@ export function apply(ctx, config = {}) {
   }
 
   /**
+   * Read a small user-owned SSH file, refusing files above maxConfigBytes.
+   * @param {string} path - file to read.
+   * @returns {{ text?: string, skipped?: number }} text, or the size that was skipped.
+   */
+  const readBoundedText = path => {
+    try {
+      const size = statSync(path).size
+      if (size > cfg.maxConfigBytes) return { skipped: size }
+      return { text: readFileSync(path, 'utf8') }
+    } catch {
+      return {}
+    }
+  }
+
+  /**
+   * Resolve a local path for ssh_copy and enforce localPathRoot confinement.
+   * Lexical containment plus a real-path check on the nearest existing
+   * ancestor keeps symlinks from escaping the root.
+   * @param {object} exec - tool run context.
+   * @param {string} localPath - model-provided local path.
+   * @returns {string} the absolute local path.
+   */
+  const resolveLocalPath = (exec, localPath) => {
+    const absolute = isAbsolute(localPath) ? resolve(localPath) : resolve(localCwd(exec), localPath)
+    if (!cfg.confineLocalPaths) return absolute
+    const root = cfg.localPathRoot === '' ? localCwd(exec) : resolve(cfg.localPathRoot)
+    const lexical = relative(root, absolute)
+    const inside = lexical === '' || (!lexical.startsWith('..') && !isAbsolute(lexical))
+    if (!inside) {
+      argsError([`localPath ${JSON.stringify(localPath)} is outside ${root}; set confineLocalPaths: false to allow it`])
+    }
+    let probe = absolute
+    while (!existsSync(probe)) {
+      const parent = dirname(probe)
+      if (parent === probe) break
+      probe = parent
+    }
+    try {
+      const realRelative = relative(realpathSync(root), realpathSync(probe))
+      const realInside = realRelative === '' || (!realRelative.startsWith('..') && !isAbsolute(realRelative))
+      if (!realInside) {
+        argsError([`localPath ${JSON.stringify(localPath)} resolves outside ${root} through a symlink; set confineLocalPaths: false to allow it`])
+      }
+    } catch {}
+    return absolute
+  }
+
+  /**
    * Resolve one session and check that the caller owns it.
    * @param {unknown} sessionId - model-provided id.
    * @param {string} ownerId - calling agent id.
@@ -527,7 +599,7 @@ export function apply(ctx, config = {}) {
       schema: {
         type: 'object',
         additionalProperties: false,
-        required: ['configPath', 'configExists', 'hosts', 'knownHosts'],
+        required: ['configPath', 'configExists', 'hosts', 'knownHosts', 'notes'],
         properties: {
           configPath: { type: 'string', description: 'Path to the SSH configuration file that was read.' },
           configExists: { type: 'boolean', description: 'Whether the configuration file exists.' },
@@ -551,6 +623,11 @@ export function apply(ctx, config = {}) {
           knownHosts: {
             type: 'array',
             description: 'Non-hashed host names recorded in known_hosts.',
+            items: { type: 'string' },
+          },
+          notes: {
+            type: 'array',
+            description: 'Warnings about files that were skipped or could not be read.',
             items: { type: 'string' },
           },
         },
@@ -581,20 +658,33 @@ export function apply(ctx, config = {}) {
           lines.push(`known_hosts names (${value.knownHosts.length}, recorded hosts, not verified shell accounts): ${shownKnown.join(', ')}${value.knownHosts.length > shownKnown.length ? `, +${value.knownHosts.length - shownKnown.length} more` : ''}`)
         }
         if (value.hosts.length === 0) lines.push('No config aliases: try a known_hosts name above, or user@host.')
+        for (const note of value.notes) lines.push(`note: ${note}`)
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
     async execute(_args, exec) {
       const configPath = resolve(homedir(), '.ssh', 'config')
       const knownHostsPath = resolve(homedir(), '.ssh', 'known_hosts')
+      const notes = []
+      const configRead = readBoundedText(configPath)
+      const knownRead = readBoundedText(knownHostsPath)
       let configExists = false
       let hosts = []
-      try {
-        hosts = parseSshConfig(readFileSync(configPath, 'utf8'))
+      if (configRead.skipped !== undefined) {
         configExists = true
-      } catch {}
+        notes.push(`config skipped: ${configRead.skipped} bytes exceeds maxConfigBytes (${cfg.maxConfigBytes})`)
+      } else if (configRead.text !== undefined) {
+        configExists = true
+        hosts = parseSshConfig(configRead.text)
+      }
+      let knownHosts = []
+      if (knownRead.skipped !== undefined) {
+        notes.push(`known_hosts skipped: ${knownRead.skipped} bytes exceeds maxConfigBytes (${cfg.maxConfigBytes})`)
+      } else if (knownRead.text !== undefined) {
+        knownHosts = parseKnownHosts(knownRead.text)
+      }
       if (exec.signal.aborted) abortedError()
-      return { configPath, configExists, hosts, knownHosts: readKnownHosts(knownHostsPath) }
+      return { configPath, configExists, hosts, knownHosts, notes }
     },
     presentCall() {
       return { card: 'generic', title: 'List SSH hosts', kind: 'search' }
@@ -745,7 +835,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'ssh_copy',
-    description: 'Copy a file or directory between this machine and a remote host over SCP. Uses the same non-interactive key authentication as ssh_exec. A relative localPath resolves against the session workspace; a relative remotePath resolves against the remote home directory. The parent directory of the destination must exist, and a timeout can leave a partial destination file. The copy runs as the Host user outside the session file sandbox, so localPath is not confined to the workspace.',
+    description: 'Copy a file or directory between this machine and a remote host over SCP. Uses the same non-interactive key authentication as ssh_exec. A relative localPath resolves against the session workspace; a relative remotePath resolves against the remote home directory. By default localPath is confined to the session workspace (or the configured localPathRoot); set confineLocalPaths: false to allow paths outside it. The parent directory of the destination must exist, and a timeout can leave a partial destination file. The copy runs as the Host user outside the session file sandbox.',
     parameters: {
       type: 'object',
       properties: {
@@ -801,7 +891,7 @@ export function apply(ctx, config = {}) {
       if (violations.length > 0) argsError(violations)
 
       const cwd = localCwd(exec)
-      const localPath = isAbsolute(args.localPath) ? args.localPath : resolve(cwd, args.localPath)
+      const localPath = resolveLocalPath(exec, args.localPath)
       const remoteSpec = `${args.host}:${args.remotePath}`
       const source = args.direction === 'upload' ? localPath : remoteSpec
       const destination = args.direction === 'upload' ? remoteSpec : localPath
@@ -840,7 +930,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'ssh_session',
-    description: 'Open and drive an interactive remote shell over SSH with an allocated remote terminal. Use this for commands that stream output, wait for input, or run indefinitely; use ssh_exec for one-shot commands. Actions: "open" starts a session on a host, waits briefly for the first output or exit, and returns its sessionId; "write" sends input to it, appending a newline unless the input already ends with one; "read" returns output produced since the previous read, waiting up to waitMs for new output; "interrupt" sends Ctrl-C; "close" terminates the session and returns any unread output; "list" shows this agent\'s sessions. Authentication is non-interactive (keys or ssh-agent only); remote prompts such as sudo can be answered with write. Terminal control sequences are stripped and only the last configured characters of output are retained. A session also ends when its remote command finishes or the connection drops.',
+    description: 'Open and drive an interactive remote shell over SSH with an allocated remote terminal. Use this for commands that stream output, wait for input, or run indefinitely; use ssh_exec for one-shot commands. Actions: "open" starts a session on a host, waits briefly for the first output or exit, and returns its sessionId; "write" sends input to it, appending a newline unless the input already ends with one; "read" returns output produced since the previous read, waiting up to waitMs for new output; "interrupt" sends Ctrl-C; "close" terminates the session and returns any unread output; "list" shows this agent\'s sessions. Authentication is non-interactive (keys or ssh-agent only). Answer non-secret prompts such as yes/no confirmations with write; never send passwords, passphrases, or tokens, because tool input is persisted in the session log. Use key-based sudo (NOPASSWD) for privileged commands. Terminal control sequences are stripped and only the last configured characters of output are retained. A session also ends when its remote command finishes or the connection drops.',
     parameters: {
       type: 'object',
       properties: {
@@ -852,7 +942,7 @@ export function apply(ctx, config = {}) {
         host: { type: 'string', description: 'Required for "open": a Host alias from ~/.ssh/config or user@host.' },
         command: { type: 'string', description: 'Optional remote command for "open"; omit to get a login shell.' },
         sessionId: { type: 'string', description: 'Required for "write", "read", "interrupt", and "close"; the id returned by "open" or "list".' },
-        input: { type: 'string', description: 'Required for "write": the text to send.' },
+        input: { type: 'string', description: 'Required for "write": the text to send. Never include passwords, passphrases, or tokens; tool input is persisted in the session log.' },
         waitMs: { type: 'number', description: 'For "read": how long to wait for new output before returning, in milliseconds (default 2000, maximum 30000).' },
       },
       required: ['action'],

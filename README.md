@@ -9,6 +9,7 @@ interactive shells on other machines through the local OpenSSH client.
 - Adds four model-facing tools: `ssh_hosts`, `ssh_exec`, `ssh_copy`, and
   `ssh_session`.
 - No UI; the tools are available to every session in the DSH profile.
+- No third-party runtime dependencies; only Node.js built-in modules.
 
 ## Requirements
 
@@ -19,6 +20,9 @@ interactive shells on other machines through the local OpenSSH client.
   always pass `BatchMode=yes`, so password and keyboard-interactive prompts are
   not supported.
 - Network reachability to the target hosts (LAN, VPN, or a bastion).
+- Target host keys in `~/.ssh/known_hosts`. The plugin verifies host keys by
+  default (`StrictHostKeyChecking=yes`); see
+  [Authentication and host keys](#authentication-and-host-keys).
 
 ## Installation
 
@@ -34,6 +38,15 @@ interactive shells on other machines through the local OpenSSH client.
 
 3. Make sure the **SSH remote control** row is enabled. The bundle inserts one
    row, `ssh-remote`, with its default config.
+
+4. Add the host keys you intend to use (replace `host.example`):
+
+   ```sh
+   ssh-keyscan -H host.example >> ~/.ssh/known_hosts
+   ```
+
+   Alternatively, connect once manually with `ssh host.example`, compare the
+   fingerprint with the host, and let the client add the key.
 
 The installation links the directory instead of copying it, so editing the
 files and recomposing the profile (toggle the row in **Plugins**) reloads the
@@ -53,7 +66,8 @@ every open session.
 
 Discovers destinations the machine can use. The config file may be missing;
 `known_hosts` names are hosts the machine has connected to, not verified shell
-accounts. Pass any returned name, or `user@host`, to the other tools.
+accounts. Pass any returned name, or `user@host`, to the other tools. Files
+larger than `maxConfigBytes` are skipped and reported in `notes`.
 
 ### `ssh_exec`
 
@@ -78,10 +92,13 @@ to finish and then hits its timeout.
 - `recursive`: copy a directory tree.
 
 A relative `localPath` resolves against the session workspace; a relative
-`remotePath` resolves against the remote home directory. The parent directory
-of the destination must exist, and a timeout can leave a partial destination
-file. The copy runs as the Host user outside the session file sandbox, so
-`localPath` is not confined to the workspace.
+`remotePath` resolves against the remote home directory. Local paths are
+confined to the session workspace by default (`confineLocalPaths: true`), with
+lexical and real-path containment checks; set `localPathRoot` to use a
+different directory, or `confineLocalPaths: false` to allow any path (not
+recommended). The parent directory of the destination must exist, and a timeout
+can leave a partial destination file. The copy runs as the Host user outside
+the session file sandbox.
 
 ### `ssh_session`
 
@@ -91,7 +108,8 @@ Actions: `open`, `write`, `read`, `interrupt`, `close`, `list`.
   returns its `sessionId`. An authentication failure is reported here instead of
   appearing as a successful open.
 - `write` sends input, appending a newline unless the input already ends with
-  one. Remote prompts such as `sudo` can be answered this way.
+  one. **Never send passwords, passphrases, or tokens**: tool input is persisted
+  in the session log. Answer only non-secret prompts such as `yes`/`no`.
 - `read` returns output produced since the previous read, waiting up to `waitMs`
   (default 2000, maximum 30000). It waits for a short quiet period after output
   arrives, so one read usually returns a whole burst.
@@ -117,18 +135,21 @@ The `ssh-remote` row accepts these fields:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `sshPath` | `ssh` | SSH executable; a bare name is searched in `PATH` and the usual system directories. |
-| `scpPath` | `scp` | SCP executable. |
+| `sshPath` | `ssh` | SSH executable. A bare name resolves from system directories first, then from PATH entries that are not group- or world-writable. |
+| `scpPath` | `scp` | SCP executable, resolved the same way. |
 | `connectTimeoutSeconds` | `10` | `ConnectTimeout` passed to every connection. |
 | `defaultTimeoutMs` | `120000` | Timeout for `ssh_exec` when the call omits `timeoutMs`, and for `ssh_copy`. |
 | `maxTimeoutMs` | `600000` | Upper bound applied to a call's `timeoutMs`. |
 | `maxOutputBytes` | `100000` | Retained characters per stream; longer output keeps the tail and sets the truncation flag. |
 | `maxResultBytes` | `200000` | Combined output bound for one `ssh_exec` call, divided across hosts and streams. |
-| `strictHostKeyChecking` | `accept-new` | One of `yes`, `no`, `ask`, `accept-new`, `off`. |
-| `extraOptions` | `[]` | Additional `ssh`/`scp` arguments, for example `-o ProxyCommand=...`. |
+| `strictHostKeyChecking` | `yes` | One of `yes`, `no`, `ask`, `accept-new`, `off`. `accept-new` trusts a host key on first contact; use it only deliberately. |
+| `extraOptions` | `[]` | Additional `ssh`/`scp` arguments, for example `-o ProxyCommand=...`. Trusted profile config only: these options can change client behavior. |
 | `maxConcurrency` | `4` | Maximum hosts `ssh_exec` talks to at once. |
 | `maxSessionsPerAgent` | `4` | Maximum live `ssh_session` sessions per agent. |
 | `sessionBufferBytes` | `262144` | Retained interactive output per session; older output is dropped and reported. |
+| `confineLocalPaths` | `true` | Confine `ssh_copy` local paths to `localPathRoot` (the session workspace when unset). |
+| `localPathRoot` | `''` | Directory used as the confinement root; empty means the session workspace. |
+| `maxConfigBytes` | `1048576` | Largest `~/.ssh/config` or `known_hosts` file the plugin will read; larger files are skipped and reported. |
 
 Edit the row in the profile patch (`cordis.patch.yml`) or the bundle's
 `cordis.patch.yml`, then recompose. An id-targeted override replaces the whole
@@ -140,18 +161,33 @@ Connections run with `BatchMode=yes`: keys or `ssh-agent` only. A host that need
 a password, a passphrase prompt, or an interactive host-key confirmation fails
 fast and returns its `stderr` to the model instead of hanging.
 
-Host keys follow `StrictHostKeyChecking` (`accept-new` by default). Once the
-target hosts are in `known_hosts`, set it to `yes` to reject unknown keys.
+Host keys are verified against `known_hosts` (`StrictHostKeyChecking=yes` by
+default). Populate the file before connecting to a new host:
+
+```sh
+ssh-keyscan -H host.example >> ~/.ssh/known_hosts
+```
+
+Verify the fingerprint out of band where possible. If you deliberately prefer
+trust-on-first-use, set `strictHostKeyChecking: accept-new`; that accepts an
+unknown key on first contact and rejects a changed key afterwards.
 
 ## Security notes
 
 - `ssh` and `scp` run as the Host user outside the session file sandbox. Local
-  paths passed to `ssh_copy` are not confined to the workspace.
-- Remote commands run with the remote user's privileges. Use `ssh_session` when
-  a remote prompt needs an answer; do not pass secrets in command lines that
-  will be logged.
-- The plugin never reads or stores private keys itself; it only invokes the
-  OpenSSH client.
+  paths are confined to the workspace by default, but the remote side runs with
+  the remote user's privileges.
+- Use a least-privilege remote account. For automation hosts, consider
+  restricting `authorized_keys` entries with `from=` or `command=`.
+- Do not type passwords, passphrases, or tokens into `ssh_session write`: tool
+  input is persisted in the session log. Use key-based sudo (`NOPASSWD`) or a
+  separate credential flow instead.
+- `extraOptions` is trusted profile configuration. It can change client behavior
+  (for example `ProxyCommand`), so never derive it from untrusted input.
+- The plugin never reads or stores private keys; it only invokes the OpenSSH
+  client.
+- The bundle has no third-party dependencies, lockfile, or install scripts. See
+  [SECURITY.md](SECURITY.md) for the reporting process and design notes.
 
 ## Limitations
 
@@ -161,9 +197,13 @@ target hosts are in `known_hosts`, set it to `yes` to reject unknown keys.
   patterns, and `Match` blocks are ignored.
 - No connection multiplexing (ControlMaster); every call opens a new SSH
   connection.
+- Truncated `ssh_exec` output is not spilled to a file.
 - Interactive output is stripped of control sequences and bounded; there is no
   window resizing.
-- Truncated `ssh_exec` output is not spilled to a file.
+- A `ssh_copy` timeout can leave a partial destination file.
+- Local path confinement is lexical plus a real-path check on the nearest
+  existing ancestor; a symlink created after that check can still change the
+  target.
 
 ## Development
 
@@ -175,6 +215,10 @@ node --check index.js
 
 To try changes, edit the files and recompose the profile (toggle the row in
 **Plugins**); the installed directory is linked to the profile.
+
+## Security policy
+
+See [SECURITY.md](SECURITY.md) for supported versions and private reporting.
 
 ## License
 
